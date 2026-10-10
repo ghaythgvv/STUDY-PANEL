@@ -7,8 +7,8 @@ An application panel in the same idea as a "Student Card" panel, but made for EL
     -> on Accept the member gets the Elite Card role (which opens the Elite Lounge category).
 
 What it does
-    /cardpanel   (admin)  posts the panel (embed + banner + button) in the current channel
-    /removecard  (mods)   takes the Elite Card role away from a member and clears their record
+    !cardpanel            (admin)  posts the panel (embed + banner + button) in the current channel
+    !removecard @member   (mods)   takes the Elite Card role away from a member and clears their record
 
     - The form has 3 big paragraph boxes. The review card shows every answer with a big ## heading.
     - Review buttons: Accept / Interview / Deny (Deny asks for a reason and DMs it to the member).
@@ -23,8 +23,9 @@ Before running:
     - Create the Elite Card role and the review channel, then set CARD_ROLE_ID and REVIEW_CHANNEL_ID
       (below, or as environment variables in Railway > Variables).
     - Make the Elite Lounge category visible ONLY to that role (the bot just hands out the role).
-    - SERVER MEMBERS INTENT enabled in the Developer Portal.
-    - Invite with the "bot" and "applications.commands" scopes.
+    - SERVER MEMBERS INTENT and MESSAGE CONTENT INTENT enabled in the Developer Portal (Bot > Privileged Gateway Intents).
+    - Invite with the "bot" scope. The bot needs View Channel, Send Messages, Embed Links, Attach Files and
+      Manage Messages (it deletes your !cardpanel message to keep the channel clean).
     - The bot needs Manage Roles, and its role must sit ABOVE the Elite Card role.
     - Put your banner picture next to this file as  card_banner.png  (or .jpg / .gif). Optional.
     - DISCORD_TOKEN env variable. This bot needs its OWN Discord application + token.
@@ -42,7 +43,6 @@ import asyncio
 from datetime import datetime, timezone
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 # =========================== CONFIG ===========================
@@ -88,8 +88,9 @@ DB_PATH = os.path.join(DATA_DIR, "card_applications.json")
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True   # needed for the "!" commands (enable it in the Developer Portal too)
 
-bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents, help_command=None)
 
 # applications[member_id] = {"status": pending|interview|accepted|denied, "updated": unix seconds,
 #                            "channel_id": int, "message_id": int}
@@ -536,17 +537,24 @@ class DenyModal(discord.ui.Modal, title="Deny Application"):
             await interaction.response.send_message("Something went wrong. Please try again.", ephemeral=True)
 
 
-# ====================== commands ======================
-@bot.tree.command(name="cardpanel", description=f"Post the {CARD_NAME} application panel in this channel. High rank only.", guild=GUILD)
-@app_commands.guild_only()
-async def cardpanel_cmd(interaction: discord.Interaction):
-    if not is_admin(interaction.user):
-        return await interaction.response.send_message("This command is for the high rank only.", ephemeral=True)
+# ====================== commands (prefix: !) ======================
+async def _tidy(ctx: commands.Context):
+    """Deletes the message that ran the command (needs Manage Messages; silently skipped otherwise)."""
+    try:
+        await ctx.message.delete()
+    except discord.HTTPException:
+        pass
 
-    problem = setup_problem(interaction.guild)
-    await interaction.response.defer(ephemeral=True)
 
-    embed = build_panel_embed(interaction.guild)
+@bot.command(name="cardpanel")
+@commands.guild_only()
+async def cardpanel_cmd(ctx: commands.Context):
+    """!cardpanel - posts the Elite Card application panel in this channel (high rank only)."""
+    if not is_admin(ctx.author):
+        return await ctx.reply("This command is for the high rank only.", delete_after=8)
+
+    problem = setup_problem(ctx.guild)
+    embed = build_panel_embed(ctx.guild)
     kwargs = {}
     banner = next((p for p in BANNER_CANDIDATES if os.path.exists(p)), None)
     if banner:
@@ -555,59 +563,62 @@ async def cardpanel_cmd(interaction: discord.Interaction):
         embed.set_image(url=f"attachment://{filename}")
 
     try:
-        await interaction.channel.send(embed=embed, view=ApplyView(), **kwargs)
+        await ctx.channel.send(embed=embed, view=ApplyView(), **kwargs)
     except discord.HTTPException as e:
         print(f"❌ Couldn't post the panel: {e}")
-        return await interaction.followup.send(
+        return await ctx.reply(
             "I couldn't post the panel here — check that I can send messages, embed links and attach files.",
-            ephemeral=True,
+            delete_after=15,
         )
 
+    await _tidy(ctx)
     notes = []
     if banner is None:
         notes.append("No `card_banner.png` found next to the bot, so the panel has no banner image.")
     if problem:
         notes.append(f"⚠️ {problem}")
-    await interaction.followup.send("Panel posted." + ("\n" + "\n".join(notes) if notes else ""), ephemeral=True)
+    if notes:
+        await ctx.send("\n".join(notes), delete_after=20)
 
 
-@bot.tree.command(name="removecard", description=f"Take the {CARD_NAME} role away from a member.", guild=GUILD)
-@app_commands.describe(member=f"The member who loses the {CARD_NAME}")
-@app_commands.guild_only()
-async def removecard_cmd(interaction: discord.Interaction, member: discord.Member):
-    if not is_reviewer(interaction.user):
-        return await interaction.response.send_message("This command is for moderators or higher.", ephemeral=True)
-    await interaction.response.defer(ephemeral=True)
+@bot.command(name="removecard")
+@commands.guild_only()
+async def removecard_cmd(ctx: commands.Context, member: discord.Member):
+    """!removecard @member - takes the Elite Card role away (moderators or higher)."""
+    if not is_reviewer(ctx.author):
+        return await ctx.reply("This command is for moderators or higher.", delete_after=8)
 
-    role = interaction.guild.get_role(CARD_ROLE_ID)
+    role = ctx.guild.get_role(CARD_ROLE_ID)
     if role is None:
-        return await interaction.followup.send("The Elite Card role wasn't found — check CARD_ROLE_ID.", ephemeral=True)
+        return await ctx.reply("The Elite Card role wasn't found — check CARD_ROLE_ID.", delete_after=10)
     if role not in member.roles:
-        return await interaction.followup.send(f"{member.mention} doesn't have the {CARD_NAME}.", ephemeral=True)
+        return await ctx.reply(f"{member.mention} doesn't have the {CARD_NAME}.", delete_after=10,
+                               allowed_mentions=discord.AllowedMentions.none())
 
     try:
-        await member.remove_roles(role, reason=f"{CARD_NAME} removed by {interaction.user}")
+        await member.remove_roles(role, reason=f"{CARD_NAME} removed by {ctx.author}")
     except discord.Forbidden:
-        return await interaction.followup.send("I can't remove that role — check my role position.", ephemeral=True)
+        return await ctx.reply("I can't remove that role — check my role position.", delete_after=10)
     except discord.HTTPException as e:
-        return await interaction.followup.send(f"Failed to remove the role: {e}", ephemeral=True)
+        return await ctx.reply(f"Failed to remove the role: {e}", delete_after=10)
 
     applications.pop(member.id, None)
     save_db()
-    await interaction.followup.send(f"Removed the **{CARD_NAME}** from {member.mention}. They can apply again.", ephemeral=True)
+    await ctx.reply(
+        f"Removed the **{CARD_NAME}** from {member.mention}. They can apply again.",
+        delete_after=15, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    print(f"❌ /{interaction.command.name if interaction.command else '?'} error: {type(error).__name__}: {error}")
-    msg = "Something went wrong running that command."
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-    except discord.HTTPException:
-        pass
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, (commands.CommandNotFound, commands.NoPrivateMessage)):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        return await ctx.reply("Usage: `!removecard @member`", delete_after=10)
+    if isinstance(error, (commands.MemberNotFound, commands.BadArgument)):
+        return await ctx.reply("I couldn't find that member.", delete_after=10)
+    print(f"❌ !{ctx.command} error: {type(error).__name__}: {error}")
 
 
 # ====================== events ======================
@@ -615,11 +626,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 async def setup_hook():
     bot.add_view(ApplyView())
     bot.add_dynamic_items(ReviewButton)
-    try:
-        synced = await bot.tree.sync(guild=GUILD)
-        print(f"🔄 Synced {len(synced)} slash command(s)")
-    except Exception as e:
-        print(f"❌ Command sync failed: {e}")
 
 
 @bot.event
